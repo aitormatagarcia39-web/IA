@@ -174,7 +174,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div>
     <label class="f" for="licKey">Clave de licencia</label>
     <div class="rowg" style="margin-top:6px">
-      <input type="text" id="licKey" placeholder="CRN-XXX-XXXXXXXX-XXXXXXXXXX" autocomplete="off" spellcheck="false">
+      <input type="text" id="licKey" placeholder="Pega aquí tu clave de licencia" autocomplete="off" spellcheck="false">
       <button class="btn primary" id="licOk" type="button">Activar</button>
       <button class="btn" id="licDel" type="button" hidden>Quitar licencia</button>
     </div>
@@ -187,6 +187,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <dialog id="setDlg"><div class="dlg" style="max-width:560px">
   <h2>Ajustes y claves</h2>
   <p class="small" style="margin:0">Las claves se guardan solo en este navegador y se envían únicamente a Google o Anthropic.</p>
+  <p class="small" id="keyNote" style="margin:0"></p>
   <label class="f">Clave de Google Gemini (gratis en aistudio.google.com)
     <input type="password" id="kGoogle" autocomplete="off" spellcheck="false"></label>
   <label class="f">Clave de Claude (de pago, opcional)
@@ -212,6 +213,9 @@ const PLANS = {
 };
 const ORDER = ["free","pro","plus"];
 const BUY_URLS = {pro:"", plus:""};   // enlaces de compra (Gumroad, Lemon Squeezy...)
+// Dirección de tu servidor intermedio (Cloudflare Worker), p. ej. "https://crn-ia.TU-USUARIO.workers.dev".
+// Con él, los usuarios no necesitan clave propia de Gemini y las licencias de Gumroad se validan en el servidor.
+const PROXY_URL = "";
 const MODELS = {
   google:["gemini-3.8-flash","gemini-3.6-flash","gemini-3.5-flash-lite","gemini-3.1-flash-lite"],
   claude:["claude-sonnet-5-5","claude-opus-5-5","claude-haiku-5-5"]
@@ -241,6 +245,24 @@ async function checkLicense(k){
   if(!plan) return null;
   return (await licSig(parts[1]+"-"+parts[2])) === parts[3] ? plan : null;
 }
+
+// Devuelve "pro"/"plus" o null. Las claves CRN-... se comprueban aquí; las de Gumroad, en el servidor.
+async function resolvePlan(key){
+  key = String(key || "").trim();
+  if(!key) return null;
+  const local = await checkLicense(key);
+  if(local) return local;
+  if(!PROXY_URL) return null;
+  try{
+    const r = await fetch(PROXY_URL + "/verify", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({license:key})});
+    const j = await r.json(), p = (j.plan === "pro" || j.plan === "plus") ? j.plan : null;
+    if(p){ try{ localStorage.setItem("crn_licplan", JSON.stringify({key, plan:p})); }catch(e){} }   // solo las válidas
+    return p;
+  }catch(e){   // sin conexión: se usa la última respuesta del servidor
+    try{ const c = JSON.parse(localStorage.getItem("crn_licplan") || "null"); return c && c.key === key ? c.plan : null; }catch(_){ return null; }
+  }
+}
+const usesProxy = () => !!PROXY_URL && !cfg.google;
 
 /* ================= Estado ================= */
 const $ = id => document.getElementById(id);
@@ -333,7 +355,7 @@ function fillBody(b, m){
 function render(){
   const log = $("log"); log.textContent = "";
   if(!messages.length){
-    log.innerHTML = '<div class="empty"><h1>¿En qué te ayudo?</h1><p>Pregunta lo que quieras, adjunta archivos o escribe <b>/imagen</b> seguido de lo que quieres ver. Antes de empezar, pega tu clave de Gemini en <b>Ajustes y claves</b>.</p></div>';
+    log.innerHTML = '<div class="empty"><h1>¿En qué te ayudo?</h1><p>Pregunta lo que quieras, adjunta archivos o escribe <b>/imagen</b> seguido de lo que quieres ver.' + (PROXY_URL ? '' : ' Antes de empezar, pega tu clave de Gemini en <b>Ajustes y claves</b>.') + '</p></div>';
   } else messages.forEach(m => log.appendChild(msgEl(m)));
   scrollDown();
 }
@@ -401,7 +423,7 @@ function openPlans(){
   $("plansDlg").showModal();
 }
 async function applyLicense(key){
-  cfg.license = key; plan = (await checkLicense(key)) || "free"; fixForPlan(); renderMenus(); renderPlanBadge(); saveCfg();
+  cfg.license = key; plan = (await resolvePlan(key)) || "free"; fixForPlan(); renderMenus(); renderPlanBadge(); saveCfg();
 }
 
 /* ================= Adjuntos ================= */
@@ -460,8 +482,10 @@ async function* streamGemini(model, hist, useWeb, signal){
   const contents = hist.map(h => ({role:h.role === "user" ? "user" : "model", parts:[{text:h.text}].concat((h.parts||[]).map(p => p.text ? {text:p.text} : {inlineData:{mimeType:p.mime, data:p.data}}))}));
   const body = {systemInstruction:{parts:[{text:SYSTEM}]}, contents};
   if(useWeb) body.tools = [{google_search:{}}];
-  const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
-    method:"POST", signal, headers:{"content-type":"application/json", "x-goog-api-key":cfg.google}, body:JSON.stringify(body)});
+  const viaProxy = usesProxy();
+  const resp = await fetch(viaProxy ? `${PROXY_URL}/chat?model=${encodeURIComponent(model)}` : `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
+    method:"POST", signal, body:JSON.stringify(body),
+    headers: viaProxy ? {"content-type":"application/json", "X-License":cfg.license || ""} : {"content-type":"application/json", "x-goog-api-key":cfg.google}});
   if(!resp.ok) throw await httpError(resp);
   for await(const ev of sse(resp)){
     const cand = ev.candidates?.[0]; if(!cand) continue;
@@ -507,7 +531,7 @@ async function send(e){
     if(il !== null && uget("images") >= il){ upsell(`Límite diario de imágenes alcanzado (${il}). Mejora tu plan para crear más.`); return; }
   } else {
     if(!allowed(plan, cfg.provider, cfg.models[cfg.provider])){ upsell("Ese modelo no está incluido en tu plan."); return; }
-    if(!cfg[cfg.provider]){ addMsgError(`Falta la clave de ${cfg.provider === "google" ? "Google Gemini" : "Claude"}. Pégala en «Ajustes y claves».`); $("setDlg").showModal(); return; }
+    if(!cfg[cfg.provider] && !(cfg.provider === "google" && PROXY_URL)){ addMsgError(`Falta la clave de ${cfg.provider === "google" ? "Google Gemini" : "Claude"}. Pégala en «Ajustes y claves».`); $("setDlg").showModal(); return; }
   }
 
   // guarda el mensaje para el autoescrito
@@ -630,7 +654,8 @@ $("model").onchange = e => {
 };
 $("web").onchange = e => { cfg.web = e.target.checked; saveCfg(); };
 $("licOk").onclick = async () => {
-  const k = $("licKey").value.trim().toUpperCase(), p = await checkLicense(k);
+  const k = $("licKey").value.trim().toUpperCase(); $("licMsg").className = "msgline"; $("licMsg").textContent = "Comprobando…";
+  const p = await resolvePlan(k);
   if(!p){ $("licMsg").textContent = "Clave no válida."; $("licMsg").className = "msgline err"; return; }
   await applyLicense(k); $("licMsg").className = "msgline"; $("licMsg").textContent = `¡Licencia activada! Plan ${PLANS[p].name}.`; openPlansRefresh();
 };
@@ -639,6 +664,7 @@ function openPlansRefresh(){ const msg = $("licMsg").textContent, cls = $("licMs
 document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest("dialog").close());
 $("settingsBtn").onclick = () => {
   $("side").classList.remove("open"); $("kGoogle").value = cfg.google; $("kClaude").value = cfg.claude;
+  $("keyNote").textContent = PROXY_URL ? "No necesitas ninguna clave para usar Gemini: CRN.IA lo pone por ti con los límites de tu plan. Si prefieres usar la tuya, pégala aquí (sin límites del servicio). Claude sí necesita tu clave." : "Para usar la IA, pega tu clave de Gemini.";
   $("themeLock").textContent = has("themes") ? "" : "(Pro y Plus)";
   const sw = $("swatches"); sw.textContent = "";
   ACCENTS.forEach(c => { const b = document.createElement("button"); b.type = "button"; b.style.background = c; b.setAttribute("aria-label", "Color " + c); b.setAttribute("aria-pressed", String(cfg.accent === c));
@@ -656,7 +682,7 @@ if("serviceWorker" in navigator && location.protocol.startsWith("http")) navigat
 
 /* ================= Arranque ================= */
 (async function init(){
-  plan = (await checkLicense(cfg.license)) || "free";
+  plan = (await resolvePlan(cfg.license)) || "free";
   fixForPlan(); renderMenus(); renderPlanBadge(); renderChips(); render(); autosize();
 })();
 </script>

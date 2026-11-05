@@ -13,6 +13,7 @@ funciona para probar, pero no se puede instalar. Lo más fácil es GitHub Pages:
    (o el icono de instalar a la derecha de la barra de direcciones).
 
 Primer uso
+- (Si montas el servidor de la carpeta crn_ia_server y pones su dirección en PROXY_URL, los usuarios no necesitan clave.)
 - Abre "Ajustes y claves" y pega tu clave de Google Gemini (gratis en aistudio.google.com).
 - Las claves se guardan solo en tu navegador.
 
